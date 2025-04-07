@@ -1,9 +1,6 @@
 #include "NetworkNode.h"
 #include <iostream>
 
-//todo line 290!!!
-//todo 2: wybieranie LIDERA
-
 extern "C" {
 #include "read_write.h"
 #include <endian.h>
