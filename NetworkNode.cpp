@@ -1,8 +1,7 @@
 #include "NetworkNode.h"
-#include <iostream>
+#include "err.h"
 
 extern "C" {
-#include "read_write.h"
 #include <endian.h>
 }
 
@@ -19,109 +18,160 @@ uint16_t Node::get_port() const{
     return port;
 }
 
-bool NetworkNode::wants_to_synchronize() {
-    return still_synchronizes;
+bool NetworkNode::node_known(const char *node_address, uint16_t node_port) const {
+    return count(connectedNodes.begin(), connectedNodes.end(), Node(node_address, node_port)) > 0;
 }
 
-
-NetworkNode::NetworkNode(const char* host, uint16_t p, int fd): Node(host, p), is_synchronized(0), sync_master_id(0) {
+NetworkNode::NetworkNode(const char* host, uint16_t p, int fd): Node(host, p), is_synchronized(false), sync_master_id(get_ip().c_str(), get_port()) {
     startTime = std::chrono::system_clock::now();
     synchronized_lvl = UINT8_MAX;
     my_fd = fd;
-    no_nodes = 0;
-    still_synchronizes = true;
     offset = 0;
-    synch_state.state = SYNC_NONE;
+    latest_SYNCH_START_sending = get_current_timestamp();
+
+    synch_state.synch_sender_state = NONE; //hasn't sent any SYNCH_START yet
+    synch_state.synch_receiver_state = IDLE; //hasn't begun to synchronize with any node
+    synch_state.waits_from = get_current_timestamp();
+    synch_state.sync_partner_id = nullptr;
+    synch_state.sync_partner_port = -1;
 }
 
-int NetworkNode::get_fd() const {
-    return my_fd;
+uint64_t NetworkNode::get_latest_SYNCH_START_sending() {
+    return latest_SYNCH_START_sending;
 }
 
-size_t NetworkNode::connected_nodes_size() const{
-    return connectedNodes.size();
-}
-
-void NetworkNode::report_nodes() {
+void NetworkNode::report_nodes() const {
     for (auto& node: connectedNodes) {
         fprintf(stderr, "host:%s port:%d\n", node.get_ip().c_str(), node.get_port());
     }
 }
 
-//returns timestamp in millis
+/*Returns timestamp according to local not-synchronized clock*/
 uint64_t NetworkNode::get_current_timestamp() {
     auto now = std::chrono::system_clock::now();
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         now - startTime).count();
 }
 
-std::pair<bool, sockaddr_in> NetworkNode::send_message(const char *target_host, uint16_t target_port, uint8_t message) {
+/*Returns timestamp adjusted with offset val*/
+uint64_t NetworkNode::get_timestamp() {
+    uint64_t timestamp = get_current_timestamp();
+    if (synchronized_lvl < UINT8_MAX) {
+        timestamp -= offset;
+    }
+    return timestamp;
+}
+
+void NetworkNode::send_TIME(const char* target_host, uint16_t target_port) {
     struct sockaddr_in server_addr;
-    //memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(target_port);
 
     if (inet_pton(AF_INET, target_host, &(server_addr.sin_addr)) <= 0) {
-        fprintf(stderr, "error converting address");
-        return std::make_pair(false, server_addr);
+        fprintf(stderr, "ERROR error converting address");
+        return;
     }
 
-    //instead of connect
+    uint8_t message = TIME;
+    uint8_t synch = synchronized_lvl;
+    uint64_t timestamp = get_timestamp();
+    uint64_t timestamp_net = htobe64(timestamp);
+
+    size_t offset = 0;
+    ssize_t buffer_size = 0;
+    buffer_size += (sizeof(message) + sizeof(synch) + sizeof(timestamp_net));
+
+    std::vector<uint8_t> buffer(buffer_size);
+
+    buffer[offset++] = message;
+
+    memcpy(&buffer[offset], &synch, sizeof(synch));
+    offset += sizeof(synch);
+
+    memcpy(&buffer[offset], &timestamp_net, sizeof(timestamp_net));
+
+    ssize_t send_bytes = sendto(my_fd, buffer.data(), buffer_size, 0,
+                                (struct sockaddr*)&server_addr, sizeof(server_addr));
+
+    if (send_bytes < buffer_size) {
+        fprintf(stderr, "ERROR error sending buffer");
+    }
+}
+
+bool NetworkNode::send_message(const char *target_host, uint16_t target_port, uint8_t message) {
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(target_port);
+
+    if (inet_pton(AF_INET, target_host, &(server_addr.sin_addr)) <= 0) {
+        fprintf(stderr, "ERROR error converting address");
+        return false;
+    }
+
     ssize_t send_bytes = sendto(my_fd, &message, sizeof(message), 0,
                                 (struct sockaddr*)&server_addr, sizeof(server_addr));
 
 
-    //ssize_t send_bytes = writen(my_fd, &message, sizeof message);
     if ((size_t)send_bytes < sizeof message) {
-         fprintf(stderr, "error sending message");
-         return std::make_pair(false, server_addr);
+        fprintf(stderr, "ERROR error sending message");
+        return false;
     }
-
-    return std::make_pair(true, server_addr);
+    return true;
 }
-
 
 void NetworkNode::send_HELLO(const char *target_host, uint16_t target_port) {
-    bool ok = send_message(target_host, target_port, HELLO).first;
+    bool ok = send_message(target_host, target_port, HELLO);
     if (!ok) {
-        fprintf(stderr, "error sending HELLO to %s %d \n", target_host, target_port);
+        fprintf(stderr, "ERROR error sending HELLO to %s %d \n", target_host, target_port);
     }
     else {
-        fprintf(stderr, "sent HELLO to %s %d \n", target_host, target_port);
+        /* to distinguish whether HELLO_REPLY is expected or not */
+        pendingHELLOS.insert(Node(target_host, target_port));
     }
 }
 
-void NetworkNode::send_HELLO_REPLY(const char *target_host, uint16_t target_port) {
-    struct sockaddr_in server_addr;
-    auto p = send_message(target_host, target_port, HELLO_REPLY);
-    if (!p.first) return;
-    server_addr = p.second;
-    //number of records
-    uint16_t count = htons(no_nodes); //in net order
-    ssize_t send_bytes = sendto(my_fd, &count, sizeof(count), 0,
-                               (struct sockaddr*)&server_addr, sizeof(server_addr));
-    if ((size_t)send_bytes < sizeof(count)) {
-        fprintf(stderr, "error sending count");
+void NetworkNode::send_HELLO_REPLY(const char* target_host, uint16_t target_port, uint8_t* received, size_t received_bytes) {
+    /* checking if message size won't exceed max size of one datagram */
+    if (connectedNodes.size() > MAX_NODE_COUNT_TO_SEND) {
+        message_err(received, received_bytes);
         return;
     }
 
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(target_port);
+
+    if (inet_pton(AF_INET, target_host, &(server_addr.sin_addr)) <= 0) {
+        fprintf(stderr, "ERROR error converting address");
+        return;
+    }
+
+    uint8_t message = HELLO_REPLY;
+    uint16_t count = htons(connectedNodes.size());
 
     size_t offset = 0;
-    size_t buffer_size = 0;
+    ssize_t buffer_size = 0;
 
-    buffer_size += connected_nodes_size() * (sizeof(uint8_t) + sizeof(in_addr) + sizeof(uint16_t));
-
-    // for (const auto& node : connectedNodes) {
-    //     buffer_size += 1;          // 1 byte for address length
-    //     buffer_size += sizeof(in_addr);  // 4 bytes for IPv4 address
-    //     buffer_size += sizeof(uint16_t); // 2 bytes for port
-    // }
+    buffer_size += sizeof(message);
+    buffer_size += sizeof(count);
+    buffer_size += connectedNodes.size() * (sizeof(uint8_t) + sizeof(in_addr) + sizeof(uint16_t));
 
     std::vector<uint8_t> buffer(buffer_size);
+    buffer[offset++] = message;
+
+    memcpy(&buffer[offset], &count, sizeof(count));
+    offset += sizeof(count);
 
     for (const auto& node : connectedNodes) {
+        if (node.get_ip() == target_host && node.get_port() == target_port) {
+            continue; /*sending everything apart from target host*/
+        }
+
         struct in_addr ip_addr;
-        inet_pton(AF_INET, node.get_ip().c_str(), &ip_addr);
+        if (inet_pton(AF_INET, node.get_ip().c_str(), &ip_addr) <= 0) {
+            fprintf(stderr, "ERROR Error creating address.");
+            continue;
+        }
 
         uint8_t addr_length = 4;
         buffer[offset++] = addr_length;
@@ -133,18 +183,17 @@ void NetworkNode::send_HELLO_REPLY(const char *target_host, uint16_t target_port
         memcpy(&buffer[offset], &port, sizeof(port));
         offset += sizeof(port);
     }
+    ssize_t send_bytes = sendto(my_fd, buffer.data(), buffer_size, 0,
+    (struct sockaddr*)&server_addr, sizeof(server_addr));
 
-    //sending to the buffer - PROBABLY CHUNKS WOULD BE NICE
-    ssize_t total_sent = sendto(my_fd, buffer.data(), buffer_size, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
-    if ((size_t)total_sent < buffer_size) {
-        fprintf(stderr, "error sending buffer");
-        return;
+    if (send_bytes < buffer_size) {
+        fprintf(stderr, "ERROR error sending buffer");
     }
-    fprintf(stderr, "sent %lu bytes of HELLO_REPLY to %s %d\n", total_sent, target_host, target_port);
+    addNode(target_host, target_port); /* nodes are now connected */
 }
 
-void NetworkNode::send_CONNECT(const char *target_host, uint16_t target_port) {
-    send_message(target_host, target_port, CONNECT);
+bool NetworkNode::send_CONNECT(const char *target_host, uint16_t target_port) {
+    return send_message(target_host, target_port, CONNECT);
 }
 
 void NetworkNode::send_ACK_CONNECT(const char *target_host, uint16_t target_port) {
@@ -152,266 +201,500 @@ void NetworkNode::send_ACK_CONNECT(const char *target_host, uint16_t target_port
 }
 
 void NetworkNode::send_DELAY_REQUEST(const char *target_host, uint16_t target_port) {
-    auto ok = send_message(target_host, target_port, DELAY_REQUEST);
-    if (ok.first) {
-        fprintf(stderr, "sent DELAY REQUEST TO %s, %d", target_host, target_port);
+    /* saving time as a reference point for waiting for DELAY RESPONSE */
+    synch_state.waits_from = get_current_timestamp();
+    if (!send_message(target_host, target_port, DELAY_REQUEST)) {
+        fprintf(stderr, "ERROR error sending DELAY_REQUEST TO %s, %d", target_host, target_port);
     }
 }
 
+/* sending data after receiving DELAY REQUEST in a correct context */
 void NetworkNode::send_DELAY_RESPONSE(const char *target_host, uint16_t target_port) {
     struct sockaddr_in server_addr;
-    auto result = send_message(target_host, target_port, DELAY_RESPONSE);
-    if (!result.first) return;
-    server_addr = result.second;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(target_port);
 
+    if (inet_pton(AF_INET, target_host, &(server_addr.sin_addr)) <= 0) {
+        fprintf(stderr, "ERROR error converting address");
+        return;
+    }
+
+    uint8_t message = DELAY_RESPONSE;
     //sending synchronized lvl
     uint8_t synch = synchronized_lvl;
-    ssize_t send_bytes = sendto(my_fd, &synch, sizeof(synch), 0,
-                                (struct sockaddr*)&server_addr, sizeof(server_addr));
-
-    if ((size_t)send_bytes < sizeof synch) {
-        fprintf(stderr, "error sending synchronized level");
-        return;
-    }
-
-    //sending current timestamp
-    uint64_t timestamp = get_current_timestamp();
-    uint64_t timestamp_net = htobe64(timestamp);
-    send_bytes = sendto(my_fd, &timestamp_net, sizeof(timestamp_net), 0,
-                                (struct sockaddr*)&server_addr, sizeof(server_addr));
-
-    if ((size_t)send_bytes < sizeof timestamp_net) {
-        fprintf(stderr, "error sending message");
-        return;
-    }
-
-    fprintf(stderr, "sent DELAY REQUEST TO %s, %d", target_host, target_port);
-}
-
-
-bool NetworkNode::synchronize() {
-    fprintf(stderr, "unimplemented");
-    return true;
-}
-
-void NetworkNode::send_time_stamp(const char* target_host, uint16_t target_port) {
-    struct sockaddr_in server_addr;
-    auto result = send_message(target_host, target_port, TIME);
-    if (!result.first) return;
-    server_addr = result.second;
-
-    uint8_t synch = synchronized_lvl;
-    ssize_t send_bytes = sendto(my_fd, &synch, sizeof(synch), 0,
-                                (struct sockaddr*)&server_addr, sizeof(server_addr));
-
-    if ((size_t)send_bytes < sizeof synch) {
-        fprintf(stderr, "error sending synchronized lvl");
-        return;
-    }
-
-    uint64_t timestamp = get_current_timestamp();
-    if (synchronized_lvl < UINT8_MAX) {
-        //the node is synchronized
-        timestamp += offset;
-    }
-
+    //sending current timestamp [updated with offset if necessary]
+    uint64_t timestamp = get_timestamp();
     uint64_t timestamp_net = htobe64(timestamp);
 
-    send_bytes = sendto(my_fd, &timestamp_net, sizeof(timestamp_net), 0,
+    size_t offset = 0;
+    ssize_t buffer_size = 0;
+
+    buffer_size += (sizeof(message) + sizeof(synch) + sizeof(timestamp_net));
+    std::vector<uint8_t> buffer(buffer_size);
+
+    buffer[offset++] = message;
+
+    memcpy(&buffer[offset], &synch, sizeof(synch));
+    offset += sizeof(synch);
+
+    memcpy(&buffer[offset], &timestamp_net, sizeof(timestamp_net));
+    ssize_t send_bytes = sendto(my_fd, buffer.data(), buffer_size, 0,
                                 (struct sockaddr*)&server_addr, sizeof(server_addr));
 
-    if ((size_t)send_bytes < sizeof timestamp_net) {
-        fprintf(stderr, "error sending timestamp");
-        return;
+    if (send_bytes < buffer_size) {
+        fprintf(stderr, "ERROR error sending buffer");
     }
-
-    fprintf(stderr, "SEND TIME to %s, %d", target_host, target_port);
 }
 
-bool NetworkNode::addNode(const char* host, uint16_t port) {
-    Node node = Node(host, port);
-    if (host == get_ip()) return false;
-    for (const auto& n: connectedNodes) { //node is identified by its ip
-        if (n.get_ip().c_str() == host) return false;
-    }
+void NetworkNode::timeout_check() {
+    uint64_t current_time = get_current_timestamp();
 
-    connectedNodes.push_back(node);
-    no_nodes++;
-    return true;
-}
-
-void NetworkNode::receive_DELAY_RESPONSE() {
-
-}
-
-//gets nodes and then sends connect
-//this function is called right after the node reads that it has received HELLO_REPLY message
-void NetworkNode::receive_HELLO_REPLY() {
-    std::vector<Node> received_nodes;
-    //reading node count
-    uint16_t received_count_net;
-    ssize_t read_bytes = recv(my_fd, &received_count_net, sizeof(received_count_net), 0);
-    uint16_t received_count = ntohs(received_count_net);
-    if ((size_t)read_bytes < sizeof received_count_net) {
-        fprintf(stderr, "Failed to read node count");
-        return;
-    }
-    size_t max_buffer_size = received_count * (1 + INET_ADDRSTRLEN + sizeof(uint16_t));
-
-    std::vector<uint8_t> buffer(max_buffer_size);
-    size_t bytes_read = 0;
-    size_t remaining = max_buffer_size;
-    uint32_t current_pos = 0;
-
-    while (remaining > 0) {
-        read_bytes = recv(my_fd, &buffer[current_pos], remaining, 0);
-        bytes_read += read_bytes;
-        current_pos += read_bytes;
-        remaining -= read_bytes;
-
-        uint chunk_size = sizeof(uint8_t) + sizeof(uint16_t) + sizeof(in_addr);
-        if (bytes_read >= (received_count * chunk_size)) {
-            break;
+    if (is_synchronized) {
+        uint64_t time_since_sync = current_time - last_SYNCH_received[sync_master_id];
+        /*checking if given timeout has already passed [25 seconds with no synch message from master] */
+        if (time_since_sync > 25000) {
+            synchronized_lvl = 255;
+            is_synchronized = false;
+            synch_state.synch_receiver_state = IDLE; //restarting the process of synchronization
         }
     }
 
-    current_pos = 0;
+    /*checking if we've received any info in the last 5 seconds of a pending synchronization process */
+    if (current_time - synch_state.waits_from > 2*SYNCH_START_SPAN) {
+        synch_state.synch_receiver_state = IDLE;
+    }
+}
+
+bool NetworkNode::addNode(const char* host, uint16_t port) {
+    /* total number of known nodes cannot exceed uint16_t max */
+    if (connectedNodes.size() >= UINT16_MAX) {
+        return false;
+    }
+
+    Node node = Node(host, port);
+    if (host == get_ip() && port == get_port()) return false; //not adding out own info
+    connectedNodes.insert(node);
+    return true;
+}
+
+
+/* Receiving T4 and calculating offset if everything in the communicate is correct */
+void NetworkNode::receive_DELAY_RESPONSE(const char* senders_address, uint16_t senders_port, uint8_t* buffer, size_t buffer_size) {
+    if (!node_known(senders_address, senders_port)) {
+        message_err(buffer, buffer_size);
+        return;
+    }
+
+    uint64_t current_time = get_current_timestamp();
+    uint64_t time_since_any_message = current_time - synch_state.waits_from;
+
+    if (time_since_any_message > 2*SYNCH_START_SPAN) {
+        message_err(buffer, buffer_size);
+        /*restarting synchronization process and ignoring the message*/
+        synch_state.synch_receiver_state = IDLE;
+        synch_state.sync_partner_id = nullptr;
+        synch_state.sync_partner_port = -1;
+        return;
+    }
+
+    size_t current_pos = 1;
+
+    if (buffer_size < current_pos + sizeof(uint8_t)) {
+        message_err(buffer, buffer_size); /*couldn't read synchronization lvl */
+        return;
+    }
+
+    uint8_t synchronized = buffer[current_pos];
+    current_pos += sizeof(uint8_t);
+
+    uint64_t T4_net;
+    if (buffer_size < current_pos + sizeof(uint64_t)) {
+        message_err(buffer, buffer_size); /*couldn't read_timestamp */
+        return;
+    }
+    memcpy(&T4_net, &buffer[current_pos], sizeof(T4_net));
+
+    uint64_t T4 = be64toh(T4_net);
+    synch_state.T4 = T4;
+
+    /*Incorrect message format.*/
+    if (T4 < synch_state.T1) {
+        message_err(buffer, buffer_size);
+    }
+
+    /*We were waiting for a response and the synchronization level stayed the same and if we received
+    this message from the one we were synchronizing with */
+    if (synch_state.synch_receiver_state == WAITING_FOR_RESPONSE && synch_state.partner_sync_level == synchronized
+        && synch_state.sync_partner_id == senders_address && synch_state.sync_partner_port == senders_port)  {
+        synchronized_lvl = synchronized + 1;
+        offset = (synch_state.T2 - synch_state.T1 + synch_state.T3 - synch_state.T4)/2;
+        is_synchronized = true;
+        sync_master_id = Node(senders_address, senders_port);
+        synch_state.last_sync_time = get_current_timestamp();
+        synch_state.waits_from = get_current_timestamp();
+        synch_state.synch_receiver_state = IDLE; //node is ready to synchronize again
+    }
+    else { /*received message in unexpected context*/
+        message_err(buffer, buffer_size);
+    }
+}
+
+void NetworkNode::send_SYNC_START() {
+    uint64_t current_time = get_current_timestamp();
+    uint64_t time_since_sending = current_time - latest_SYNCH_START_sending;
+
+    if (time_since_sending < SYNCH_START_SPAN) return;
+    if (synchronized_lvl >= 254) return;
+
+    uint32_t any_success = 0;
+    for (const auto& node: connectedNodes) {
+        struct sockaddr_in server_addr;
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(node.get_port());
+
+        if (inet_pton(AF_INET, node.get_ip().c_str(), &(server_addr.sin_addr)) <= 0) {
+            fprintf(stderr, "ERROR Error converting address");
+            continue;
+        }
+
+        size_t offset = 0;
+        ssize_t buffer_size = 0;
+
+        uint8_t message = SYNC_START;
+        uint8_t synchronized = synchronized_lvl;
+        uint64_t timestamp = get_timestamp(); //time updated with offset if node is synchronized
+        uint64_t timestamp_net = htobe64(timestamp);
+
+        buffer_size += (sizeof(message) + sizeof(synchronized) + sizeof(timestamp_net));
+        std::vector<uint8_t> buffer(buffer_size);
+        buffer[offset++] = message;
+
+        memcpy(&buffer[offset], &synchronized, sizeof(synchronized));
+        offset += sizeof(synchronized);
+
+        memcpy(&buffer[offset], &timestamp_net, sizeof(timestamp_net));
+
+        ssize_t send_bytes = sendto(my_fd, buffer.data(), buffer_size, 0,
+                              (struct sockaddr*)&server_addr, sizeof(server_addr));
+
+        if (send_bytes < buffer_size) {
+            fprintf(stderr, "ERROR Error sending buffer");
+            continue;
+        }
+        any_success++;
+
+        if (last_SYNCH_sent.find(node) == last_SYNCH_sent.end()) {
+            last_SYNCH_sent[node] = 1;
+        }
+        else {
+            last_SYNCH_sent[node]++; //saving that we tried to send SYNCH_START
+        }
+    }
+
+    /*saving when synch start has been sent [to make sure we do so every 5 seconds] */
+    latest_SYNCH_START_sending = get_current_timestamp();
+    if (any_success) {
+        synch_state.synch_sender_state = WAITING_FOR_REQUEST;
+        synch_state.waits_from = latest_SYNCH_START_sending;
+    }
+}
+
+
+void NetworkNode::receive_SYNC_START(const char* senders_address, uint16_t senders_port, uint8_t* buffer, size_t buffer_size) {
+    if (!node_known(senders_address, senders_port)) {
+        message_err(buffer, buffer_size);
+        return;
+    }
+
+    uint64_t t2 = get_current_timestamp();
+    last_SYNCH_received[Node(senders_address, senders_port)] = t2; //saving last time of synchronization
+    size_t current_pos = 1;
+
+    if (buffer_size < current_pos + sizeof(uint8_t)) {
+        message_err(buffer, buffer_size);
+        fprintf(stderr, "ERROR not enough bytes for synchronized\n");
+        return;
+    }
+
+    /*reading synchronized*/
+    uint8_t sender_sync_level = buffer[current_pos];
+    current_pos += sizeof(sender_sync_level);
+
+    if (buffer_size < current_pos + sizeof(uint64_t)) {
+        message_err(buffer, buffer_size); //couldn't read timestamp
+        return;
+    }
+
+    /*reading timestamp*/
+    uint64_t sender_timestamp_net;
+    memcpy(&sender_timestamp_net, &buffer[current_pos], sizeof(sender_timestamp_net));
+    uint64_t sender_timestamp = be64toh(sender_timestamp_net);
+
+    /* checking if we are currently synchronized with the sender */
+    bool is_sync_with_sender = (sync_master_id.get_ip() == senders_address
+        && sync_master_id.get_port() == senders_port
+        && is_synchronized);
+
+    if (is_sync_with_sender) {
+        bool should_sync = (sender_sync_level < synchronized_lvl);
+        if (!should_sync) { //received a message with sync level larger than one's own
+            message_err(buffer, buffer_size); /*ignoring the message */
+            synchronized_lvl = UINT8_MAX;
+            is_synchronized = false;
+            return;
+        }
+    }
+    else {
+        if (sender_sync_level >= UINT8_MAX-1) {
+            message_err(buffer, buffer_size); /*ignoring the message*/
+            return;
+        }
+        if (sender_sync_level + 2 > synchronized_lvl) {
+            message_err(buffer, buffer_size); /*ignoring the message*/
+            return;
+        }
+    }
+
+    /*checking if the node is already synchronizing with other node */
+    if (synch_state.synch_receiver_state == WAITING_FOR_RESPONSE && get_current_timestamp() - synch_state.waits_from < 2*SYNCH_START_SPAN) {
+        message_err(buffer, buffer_size); /*ignoring the communicate */
+        return;
+    }
+
+    /*node is ready to synchronize since the timeout of waiting for response has passed */
+    if (synch_state.synch_receiver_state == WAITING_FOR_RESPONSE) {
+        synch_state.synch_receiver_state = IDLE;
+    }
+
+    /* Saving data about synchronization */
+    synch_state.sync_partner_id = senders_address; //who we are trying to synchronize currently [ip]
+    synch_state.sync_partner_port = senders_port; //who we are trying to synchronize currently [port]
+    synch_state.partner_sync_level = sender_sync_level; //partner's synchronized level
+    synch_state.T1 = sender_timestamp; //first timestamp
+    synch_state.T2 = t2; //timestamp of receiving the SYNC_START message
+    synch_state.synch_receiver_state = WAITING_FOR_RESPONSE; //waiting for t4 which will be received in DELAY_RESPONSE
+
+    /*sending DELAY_REQUEST and saving the time */
+    synch_state.T3 = get_current_timestamp();
+
+    synch_state.waits_from = get_current_timestamp(); //to check if timeout didn't pass
+    send_DELAY_REQUEST(senders_address, senders_port);
+}
+
+
+void NetworkNode::receive_DELAY_REQUEST(const char* senders_address, uint16_t senders_port, uint8_t* buffer, size_t buffer_size) {
+    /*checking if we've sent SYNC_START to that node*/
+    if (last_SYNCH_sent.find(Node(senders_address, senders_port)) == last_SYNCH_sent.end()) {
+        message_err(buffer, buffer_size); //received message from unknown node
+        return;
+    }
+
+    last_SYNCH_sent[Node(senders_address, senders_port)]--;
+    if (last_SYNCH_sent[Node(senders_address, senders_port)] == 0) {
+        last_SYNCH_sent.erase(Node(senders_address, senders_port));
+    }
+
+    uint64_t current_time = get_current_timestamp();
+    uint64_t time_since_any_message = current_time - synch_state.waits_from;
+
+    if (time_since_any_message > 2*SYNCH_START_SPAN) {
+        message_err(buffer, buffer_size); //ignoring message
+        if (last_SYNCH_sent.size() == 0) {
+            synch_state.synch_sender_state = NONE; //no DELAY_RESPONSES left to receive
+        }
+        return;
+    }
+
+    /*checking if node should be sending SYNCH_START at all */
+    if (synch_state.synch_sender_state != WAITING_FOR_REQUEST) {
+        message_err(buffer, buffer_size);
+        return; //the node didn't start the synchronization process yet received this message
+    }
+    send_DELAY_RESPONSE(senders_address, senders_port);
+}
+
+/*Response to HELLO message. Node receives all the nodes known by the one to whom it
+ *sent HELLO*/
+void NetworkNode::receive_HELLO_REPLY(const char* senders_address, uint16_t senders_port, uint8_t* buffer, size_t buffer_size) {
+    if (count(pendingHELLOS.begin(), pendingHELLOS.end(), Node(senders_address, senders_port)) < 1){
+        message_err(buffer, buffer_size);
+        return;
+    }
+    pendingHELLOS.erase(Node(senders_address, senders_port));
+    std::vector<Node> received_nodes;
+    size_t current_pos = 1;
+
+    if (buffer_size < current_pos + sizeof(uint16_t)) {
+        message_err(buffer, buffer_size); //not enough bytes for node count
+        return;
+    }
+
+    uint16_t received_count_net;
+    memcpy(&received_count_net, &buffer[current_pos], sizeof(received_count_net));
+    uint16_t received_count = ntohs(received_count_net);
+    current_pos += sizeof(received_count_net);
+
     for (uint32_t i = 0; i < received_count; i++) {
+        if (current_pos + sizeof(uint8_t) > buffer_size) {
+            message_err(buffer, buffer_size); //buffer too small to read address length
+            return;
+        }
+
         uint8_t addr_length = buffer[current_pos];
         current_pos += sizeof(uint8_t);
+
+        if (current_pos + addr_length > buffer_size) {
+            message_err(buffer, buffer_size); //buffer too small to read ip
+            return;
+        }
 
         struct in_addr ip_addr;
         memcpy(&ip_addr, &buffer[current_pos], addr_length);
         current_pos += addr_length;
 
         char ip_str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &ip_addr, ip_str, INET_ADDRSTRLEN);
+
+        //check for correct peer address
+        if (inet_ntop(AF_INET, &ip_addr, ip_str, INET_ADDRSTRLEN) == nullptr) {
+            message_err(buffer, buffer_size);
+            return;
+        }
+
+        if (current_pos + sizeof(uint16_t) > buffer_size) {
+            message_err(buffer, buffer_size);
+            return; //incorrect message format, returning
+        }
 
         uint16_t port_net;
         memcpy(&port_net, &buffer[current_pos], sizeof(port_net));
         current_pos += sizeof(port_net);
         uint16_t port = ntohs(port_net);
 
-        received_nodes.push_back(Node(ip_str, port)); //idk if connect should be send to all of these nodes
-        //fprintf(stderr, "Adding node with IP: %s and port: %d\n", ip_str, port);
+        /*checking if we got receiver or sender of this message */
+        if ((ip_str == senders_address && port == senders_port) ||
+            (ip_str == get_ip() && port == get_port())) {
+            message_err(buffer, buffer_size);
+            return;
+        }
+        received_nodes.push_back(Node(ip_str, port));
     }
 
-    //sending CONNECT requests
+    /*sending connect requests */
     for (auto& node : received_nodes) {
-        send_CONNECT(node.get_ip().c_str(), node.get_port());
+        bool ok = send_CONNECT(node.get_ip().c_str(), node.get_port());
+        if (ok) {
+            pendingCONNECTS.insert(Node(node.get_ip().c_str(), node.get_port()));
+        }
+        else {
+            fprintf(stderr, "ERROR error sending CONNECT to %s:%d", node.get_ip().c_str(), node.get_port());
+        }
+    }
+    addNode(senders_address, senders_port); //receiver and sender are now connected
+}
+
+void NetworkNode::receive_LEADER(uint8_t* buffer, size_t buffer_size) {
+    size_t current_pos = 1;
+
+    if (buffer_size < current_pos + sizeof(uint8_t)) {
+        message_err(buffer, buffer_size); //not enough bytes for synchronized
+        return;
+    }
+
+    /*reading synchronized */
+    uint8_t synchronized = buffer[current_pos];
+
+    if (synchronized == 0) {
+        synchronized_lvl = 0;
+        latest_SYNCH_START_sending = get_current_timestamp() + SYNCH_START_SPAN - 2000; //after 2 secs the synch start will be sent
+    }
+    else if (synchronized == 255) {
+        if (synchronized_lvl == 0) {
+            synchronized_lvl = 255; //with this lvl the node won't send any new SYNC_STARTS
+            is_synchronized = false;
+        }
+        else {
+            message_err(buffer, buffer_size); //not-a-leader received this message
+        }
+    }
+    else {
+        message_err(buffer, buffer_size); //incorrect synchronized value
     }
 }
 
-
-void NetworkNode::receive_SYNC_START(const char* host, uint16_t port) {
-    if (node->sync_ctx.state != SYNC_IDLE && sender_id != node->sync_ctx.sync_partner_id) {
-        return;
-    }
-
-    // Check if sender is known (implementation dependent)
-    if (!is_node_known(sender_id)) {
-        return;
-    }
-
-    // Check if sender's sync level is < 254
-    if (sender_sync_level >= 254) {
-        return;
-    }
-
-    // Check our relationship with the sender
-    bool is_sync_with_sender = (node->sync_master_id == sender_id && node->is_synchronized);
-
-    // Apply synchronization rules
-    bool should_sync = false;
-    if (is_sync_with_sender) {
-        // For nodes we're synchronized with
-        should_sync = (sender_sync_level < node->sync_level);
-    } else {
-        // For nodes we're not synchronized with
-        should_sync = (sender_sync_level + 2 <= node->sync_level);
-    }
-
-    if (!should_sync) {
-        return;
-    }
-
-    // Record timestamps and prepare for next step
-    uint32_t t2 = get_local_time();
-
-    // Save synchronization context
-    node->sync_ctx.sync_partner_id = sender_id;
-    node->sync_ctx.partner_sync_level = sender_sync_level;
-    node->sync_ctx.t1 = sender_timestamp;
-    node->sync_ctx.t2 = t2;
-    node->sync_ctx.state = SYNC_WAITING_FOR_REQUEST;
-
-    // Send DELAY_REQUEST
-    uint32_t t3 = get_local_time();
-    node->sync_ctx.t3 = t3;
-    send_message(sender_id, DELAY_REQUEST, 0, 0); // No timestamp needed for request
-    fprintf(stderr, "unimplemented!!");
-}
-
-
-//this function is called just to receive a first message to know what type
-//of communicate it is. thanks to that we know the ip address and port
-//of the one sending
+/*Base function to receive message and determine the type.*/
 void NetworkNode::receive_message() {
+    uint8_t buffer[MAX_BUFFER_SIZE];
+    memset(buffer, 0, MAX_BUFFER_SIZE);
+
     struct sockaddr_in sender_addr;
     socklen_t addr_len = (socklen_t) sizeof(sender_addr);
-    uint8_t message;
 
-    ssize_t bytes_received = recvfrom(my_fd, &message, sizeof(message), 0,
-                                     (sockaddr*)&sender_addr, &addr_len);
+    ssize_t bytes_received = recvfrom(my_fd, &buffer, sizeof(buffer), 0,
+                                      (sockaddr*)&sender_addr, &addr_len);
 
     if (bytes_received < 0) {
-        fprintf(stderr, "no message received");
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return;
+        }
+        else {
+            fprintf(stderr, "ERROR Recvfrom error");
+            return;
+        }
+    }
+    else if (bytes_received == 0) {
+        fprintf(stderr, "ERROR Empty datagram received\n");
         return;
     }
 
-    char const *senders = inet_ntoa(sender_addr.sin_addr);
+    uint8_t message = buffer[0];
+    const char *senders = inet_ntoa(sender_addr.sin_addr);
     uint16_t senders_port = ntohs(sender_addr.sin_port);
 
-    //checking what type of message was received
     switch (message) {
-        case HELLO: //replying to HELLO
-            fprintf(stderr, "received HELLO from %s %d \n", senders, senders_port);
-        send_HELLO_REPLY(senders, senders_port);
-        break;
-        case HELLO_REPLY: //getting data about connected nodes
-            fprintf(stderr, "received HELLO_REPLY from %s %d \n", senders, senders_port);
-        receive_HELLO_REPLY();
-        break;
-        case CONNECT: {
-            //adding the new node to the list of connected nodes and reassuring the sender that the message has been received
-            fprintf(stderr, "received CONNECT from %s %d \n", senders, senders_port);
+        case HELLO:
+            //fprintf(stderr, "received HELLO from %s %d \n", senders, senders_port);
+            send_HELLO_REPLY(senders, senders_port, buffer, bytes_received);
+            break;
+        case HELLO_REPLY:
+            //fprintf(stderr, "received HELLO_REPLY from %s %d \n", senders, senders_port);
+            receive_HELLO_REPLY(senders, senders_port, buffer, bytes_received);
+            break;
+        case CONNECT:
+            //fprintf(stderr, "received CONNECT from %s %d \n", senders, senders_port);
             if (addNode(senders, senders_port)) {
                 send_ACK_CONNECT(senders, senders_port);
             }
             break;
-        }
         case ACK_CONNECT:
-            //adding the node which sent ACK_CONNECT to the list
-            fprintf(stderr, "received ACK_CONNECT from %s %d \n", senders, senders_port);
+            //fprintf(stderr, "received ACK_CONNECT from %s %d \n", senders, senders_port);
+            if (count(pendingCONNECTS.begin(), pendingCONNECTS.end(), Node(senders, senders_port)) < 1) {
+                message_err(buffer, bytes_received);
+                break;
+            }
+            pendingCONNECTS.erase(Node(senders, senders_port));
             addNode(senders, senders_port);
             break;
         case GET_TIME:
-            send_time_stamp(senders, senders_port); //this will be TIME communicate in the future
-            break;
-        case DELAY_REQUEST:
-            send_DELAY_RESPONSE(senders, senders_port);
-            break;
-        case DELAY_RESPONSE:
-            //continues to synchronize, calculating offset and updating synchronized lvl
+            //fprintf(stderr, "received GET_TIME from %s %d \n", senders, senders_port);
+            send_TIME(senders, senders_port);
             break;
         case SYNC_START:
-            receive_SYNC_START();
+            //fprintf(stderr, "received SYNC_START from %s %d \n", senders, senders_port);
+            receive_SYNC_START(senders, senders_port, buffer, bytes_received);
+            break;
+        case DELAY_REQUEST:
+            //fprintf(stderr, "received DELAY_REQUEST from %s %d \n", senders, senders_port);
+            receive_DELAY_REQUEST(senders, senders_port, buffer, bytes_received);
+            break;
+        case DELAY_RESPONSE:
+            //fprintf(stderr, "received DELAY_RESPONSE from %s %d \n", senders, senders_port);
+            receive_DELAY_RESPONSE(senders, senders_port, buffer, bytes_received);
+            break;
+        case LEADER:
+            //fprintf(stderr, "received LEADER from %s %d \n", senders, senders_port);
+            receive_LEADER(buffer, bytes_received);
             break;
         default:
-            fprintf(stderr, "incorrect message");
-            break;
+            message_err(buffer, bytes_received);
     }
 }
-
-
-

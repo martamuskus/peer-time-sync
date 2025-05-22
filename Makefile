@@ -9,14 +9,13 @@ TARGET1 = peer-time-sync
 
 all: $(TARGET1)
 
-peer-time-sync.o: peer-time-sync.cpp err.h utils.h
 err.o: err.cpp err.h
-utils.o: utils.cpp utils.h
-read_write.o: read_write.c read_write.h
 InputParser.o: InputParser.cpp InputParser.h
-NetworkNode.o: NetworkNode.cpp NetworkNode.h read_write.h
+NetworkNode.o: NetworkNode.cpp NetworkNode.h config.h err.h
+peer-time-sync.o: peer-time-sync.cpp err.h utils.h InputParser.h NetworkNode.h config.h
+utils.o: utils.cpp err.h
 
-$(TARGET1): $(TARGET1).o err.o utils.o InputParser.o NetworkNode.o read_write.o
+$(TARGET1): $(TARGET1).o err.o utils.o InputParser.o NetworkNode.o
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
 clean:

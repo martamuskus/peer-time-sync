@@ -13,3 +13,8 @@ constexpr uint8_t LEADER = 21;
 
 constexpr uint8_t GET_TIME = 31;
 constexpr uint8_t TIME = 32;
+
+constexpr uint16_t MAX_BUFFER_SIZE = UINT16_MAX; //maximal size of one datagram
+constexpr uint16_t MAX_NODE_COUNT_TO_SEND = 9358; //maximal count of nodes for package not to exceed size of one datagram
+
+constexpr uint64_t SYNCH_START_SPAN = 5000;

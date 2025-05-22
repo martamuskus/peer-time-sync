@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <cstdint>
 
 #include "err.h"
 
@@ -31,4 +32,14 @@
 
     fprintf(stderr, "\n");
     exit(1);
+}
+
+void message_err(const uint8_t* buffer, size_t buffer_len) {
+    size_t bytes_to_write = (buffer_len < 10) ? buffer_len : 10;
+
+    fprintf(stderr, "ERROR MSG ");
+    for (size_t i = 0; i < bytes_to_write; i++) {
+        fprintf(stderr, "%02x ", buffer[i]);
+    }
+    fprintf(stderr, "\n");
 }

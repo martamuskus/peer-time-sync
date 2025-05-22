@@ -7,4 +7,7 @@
 // Print information about an error and quits.
 [[noreturn]] void fatal(const char* fmt, ...);
 
+// Print information about incorrect message and continue on.
+void message_err(const uint8_t* buffer, size_t buffer_len);
+
 #endif
